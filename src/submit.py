@@ -1,6 +1,6 @@
 """Generate test predictions and build a submission zip.
 
-Usage: python -m src.submit --ckpt ~/static_obstracle/checkpoints/best.pt
+Usage: python -m src.submit --ckpt ~/static_obstracle/checkpoints/best_lss.pt --tta
 """
 import argparse
 import zipfile
@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 from src.config import (
     CKPT_DIR,
     DATA_ROOT,
+    IMAGE_SIZE,
     SPLIT_DIRS,
     SUBMISSION_DIR,
     TRAIN_CONFIG,
@@ -23,8 +24,23 @@ from src.dataset import StaticBEVDataset
 from src.factory import build_model
 
 
+def _hflip_inputs(images, intrinsics, car2cams, target_w):
+    """Mirror images and adjust K, car2cams to keep geometry consistent (matches
+    the train-time hflip aug in dataset.py)."""
+    images_f = torch.flip(images, dims=[-1])
+    K = intrinsics.clone()
+    K[..., 0, 2] = (target_w - 1) - K[..., 0, 2]
+    M_x = torch.eye(4, dtype=car2cams.dtype, device=car2cams.device)
+    M_x[0, 0] = -1
+    M_y = torch.eye(4, dtype=car2cams.dtype, device=car2cams.device)
+    M_y[1, 1] = -1
+    c2c_f = M_x @ car2cams @ M_y
+    return images_f, K, c2c_f
+
+
 @torch.no_grad()
-def predict_test(model, data_root, batch_size, num_workers, device):
+def predict_test(model, data_root, batch_size, num_workers, device,
+                 tta=False, threshold=0.5):
     test_dir = Path(data_root) / SPLIT_DIRS["test"]
     info = pd.read_csv(test_dir / "info.csv", index_col=0)
     ds = StaticBEVDataset(data_root, split="test")
@@ -32,16 +48,26 @@ def predict_test(model, data_root, batch_size, num_workers, device):
 
     pred_dir = test_dir / "predicted_static_grids"
     pred_dir.mkdir(exist_ok=True)
+    target_w = IMAGE_SIZE[1]
 
     model.eval()
     written = 0
-    for batch in tqdm(loader, desc="test inference"):
+    for batch in tqdm(loader, desc=f"test inference{' (TTA)' if tta else ''}"):
         images = batch["images"].to(device, non_blocking=True)
         intrinsics = batch["intrinsics"].to(device, non_blocking=True)
         car2cams = batch["car2cams"].to(device, non_blocking=True)
         idxs = batch["index"].tolist()
+
         logits = model(images, intrinsics, car2cams)
-        preds = (torch.sigmoid(logits) > 0.5).cpu().numpy().astype(np.int32)  # (B, 1, 188, 126)
+        probs = torch.sigmoid(logits)
+
+        if tta:
+            images_f, K_f, c2c_f = _hflip_inputs(images, intrinsics, car2cams, target_w)
+            logits_f = model(images_f, K_f, c2c_f)
+            probs_f = torch.flip(torch.sigmoid(logits_f), dims=[-1])
+            probs = (probs + probs_f) / 2
+
+        preds = (probs > threshold).cpu().numpy().astype(np.int32)  # (B, 1, 188, 126)
         for i, idx in enumerate(idxs):
             rel = info.iloc[idx]["predicted_occupancy_grid"]
             out_path = Path(data_root) / rel
@@ -73,7 +99,10 @@ def main(args):
     model.load_state_dict(state)
     print(f"Loaded {model_name} checkpoint from {args.ckpt}")
 
-    test_dir = predict_test(model, args.data_root, args.batch_size, args.num_workers, device)
+    test_dir = predict_test(
+        model, args.data_root, args.batch_size, args.num_workers, device,
+        tta=args.tta, threshold=args.threshold,
+    )
     build_zip(test_dir, Path(args.out))
 
 
@@ -86,6 +115,8 @@ def parse_args():
     p.add_argument("--out", type=str, default=str(SUBMISSION_DIR / "submission.zip"))
     p.add_argument("--batch_size", type=int, default=TRAIN_CONFIG["batch_size"])
     p.add_argument("--num_workers", type=int, default=TRAIN_CONFIG["num_workers"])
+    p.add_argument("--tta", action="store_true", help="Average predictions of normal + hflipped input")
+    p.add_argument("--threshold", type=float, default=0.5)
     return p.parse_args()
 
 
