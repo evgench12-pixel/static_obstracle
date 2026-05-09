@@ -59,14 +59,21 @@ def get_geometry(frustum, intrinsics, car2cams):
     Computed in fp32 regardless of autocast — torch.linalg.inv is unstable in fp16.
 
     frustum: (D, H', W', 3) in image+depth coords
-    intrinsics: (B, N, 3, 3) camera intrinsic K
-    car2cams: (B, N, 4, 4) — semantically camera→car (despite the contest naming)
+    intrinsics: (B, N, 3, 4) — projection matrix [K | 0]; we drop the zero column
+    car2cams: (B, N, 4, 4) — transforms a car-frame point into the camera frame.
+        (The contest spec text is misleading; verified by checking the middle
+        frontal camera's recovered origin in car frame: ≈(2.02, -0.16, 1.25),
+        i.e. ~2m forward, on centerline, ~1.25m high — only consistent with
+        car→cam, so we invert it here.)
 
     Returns: (B, N, D, H', W', 3) — points in car frame, fp32.
     """
     intrinsics = intrinsics.float()
     car2cams = car2cams.float()
     frustum = frustum.float()
+
+    if intrinsics.shape[-1] == 4:  # [K | 0] → K
+        intrinsics = intrinsics[..., :3]
 
     B, N = intrinsics.shape[:2]
     D, H, W, _ = frustum.shape
@@ -78,7 +85,8 @@ def get_geometry(frustum, intrinsics, car2cams):
     inv_K[..., :3, :3] = torch.linalg.inv(intrinsics)
     inv_K[..., 3, 3] = 1.0
 
-    transform = (car2cams @ inv_K).view(B, N, 1, 1, 1, 4, 4)
+    cam_to_car = torch.linalg.inv(car2cams)  # car→cam → cam→car
+    transform = (cam_to_car @ inv_K).view(B, N, 1, 1, 1, 4, 4)
     frust_h = frust_h.view(1, 1, D, H, W, 4, 1)
     points = (transform @ frust_h).squeeze(-1)  # (B, N, D, H, W, 4)
     return points[..., :3]
