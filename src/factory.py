@@ -5,7 +5,8 @@ from src.model import MultiCamCNN
 
 MODELS = {
     "multicam_cnn": MultiCamCNN,
-    "lss": LiftSplatShoot,
+    "lss": LiftSplatShoot,                                       # ResNet18 backbone
+    "lss_r50": lambda **kw: LiftSplatShoot(backbone="resnet50", **kw),
 }
 
 

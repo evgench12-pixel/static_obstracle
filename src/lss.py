@@ -132,17 +132,23 @@ def voxel_pool(features, geom, bev_x_range, bev_y_range, bev_res, bev_shape):
     return bev.to(features.dtype)
 
 
+_BACKBONES = {
+    "resnet18": (torchvision.models.resnet18,
+                 torchvision.models.ResNet18_Weights.IMAGENET1K_V1, 256, 512),
+    "resnet50": (torchvision.models.resnet50,
+                 torchvision.models.ResNet50_Weights.IMAGENET1K_V2, 1024, 2048),
+}
+
+
 class CamEncoder(nn.Module):
-    """ResNet18 with a tiny FPN-like merge of layer3 (/16) and upsampled layer4 (/32→/16).
+    """ResNet backbone with FPN-like merge of layer3 (/16) and upsampled layer4 (/32→/16)."""
 
-    Combining both keeps the full ResNet18 capacity (~11M params) AND yields
-    dense /16 features for the splat step.
-    """
-
-    def __init__(self, depth_bins=DEPTH_BINS, feat_dim=64, pretrained=True):
+    def __init__(self, backbone="resnet18", depth_bins=DEPTH_BINS, feat_dim=64, pretrained=True):
         super().__init__()
-        weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-        rn = torchvision.models.resnet18(weights=weights)
+        if backbone not in _BACKBONES:
+            raise ValueError(f"unknown backbone {backbone!r}; available: {list(_BACKBONES)}")
+        ctor, weights_enum, ch3, ch4 = _BACKBONES[backbone]
+        rn = ctor(weights=weights_enum if pretrained else None)
         self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
         self.layer1 = rn.layer1
         self.layer2 = rn.layer2
@@ -151,7 +157,7 @@ class CamEncoder(nn.Module):
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.depth_bins = depth_bins
         self.feat_dim = feat_dim
-        self.head = nn.Conv2d(256 + 512, depth_bins + feat_dim, 1)
+        self.head = nn.Conv2d(ch3 + ch4, depth_bins + feat_dim, 1)
 
     def forward(self, x):
         x = self.stem(x)
@@ -224,6 +230,7 @@ class LiftSplatShoot(nn.Module):
         bev_res=BEV_RES,
         bev_shape=OUT_SIZE,
         pretrained=True,
+        backbone="resnet18",
     ):
         super().__init__()
         self.image_size = image_size
@@ -234,7 +241,9 @@ class LiftSplatShoot(nn.Module):
         self.bev_res = bev_res
         self.bev_shape = bev_shape
 
-        self.encoder = CamEncoder(depth_bins=depth_bins, feat_dim=feat_dim, pretrained=pretrained)
+        self.encoder = CamEncoder(
+            backbone=backbone, depth_bins=depth_bins, feat_dim=feat_dim, pretrained=pretrained
+        )
         self.bev_decoder = BEVDecoder(in_ch=feat_dim, out_ch=1)
 
         self.register_buffer(
