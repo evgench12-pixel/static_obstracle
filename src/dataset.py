@@ -25,7 +25,7 @@ from src.config import (
 def build_image_transform(image_size=IMAGE_SIZE):
     return v2.Compose([
         v2.PILToTensor(),
-        v2.Resize(image_size),
+        v2.Resize(image_size, antialias=True),
         v2.ConvertImageDtype(torch.float32),
         v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
