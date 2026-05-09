@@ -32,4 +32,6 @@ TRAIN_CONFIG = {
     "epochs": 10,
     "log_every": 50,
     "amp": True,
+    "hflip_prob": 0.5,
+    "pos_weight": 1.5,
 }

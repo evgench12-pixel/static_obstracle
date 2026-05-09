@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -16,7 +17,7 @@ from src.losses import masked_bce_with_logits
 from src.metrics import MeanIoU
 
 
-def train_one_epoch(model, loader, optim, scaler, device, log_every=50):
+def train_one_epoch(model, loader, optim, scaler, device, log_every=50, pos_weight=None):
     model.train()
     losses = []
     pbar = tqdm(loader, desc="train")
@@ -29,7 +30,7 @@ def train_one_epoch(model, loader, optim, scaler, device, log_every=50):
         optim.zero_grad(set_to_none=True)
         with autocast(enabled=scaler is not None):
             logits = model(images, intrinsics, car2cams)
-            loss = masked_bce_with_logits(logits, gt)
+            loss = masked_bce_with_logits(logits, gt, pos_weight=pos_weight)
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.step(optim)
@@ -65,7 +66,7 @@ def main(args):
     print(f"Device: {device}")
     print(f"Config: {cfg}")
 
-    train_ds = StaticBEVDataset(cfg["data_root"], split="train")
+    train_ds = StaticBEVDataset(cfg["data_root"], split="train", hflip_prob=cfg["hflip_prob"])
     val_ds = StaticBEVDataset(cfg["data_root"], split="val")
     train_loader = DataLoader(
         train_ds, batch_size=cfg["batch_size"], shuffle=True,
@@ -80,6 +81,7 @@ def main(args):
     model = build_model(cfg["model"]).to(device)
     print(f"Model: {cfg['model']} ({sum(p.numel() for p in model.parameters()):,} params)")
     optim = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    scheduler = CosineAnnealingLR(optim, T_max=cfg["epochs"], eta_min=cfg["lr"] * 0.01)
     scaler = GradScaler() if (cfg["amp"] and device.type == "cuda") else None
 
     ckpt_dir = Path(cfg["ckpt_dir"])
@@ -89,15 +91,17 @@ def main(args):
     for epoch in range(cfg["epochs"]):
         t0 = time.time()
         train_loss = train_one_epoch(
-            model, train_loader, optim, scaler, device, cfg["log_every"]
+            model, train_loader, optim, scaler, device, cfg["log_every"],
+            pos_weight=cfg["pos_weight"],
         )
         val_metrics = evaluate(model, val_loader, device)
+        scheduler.step()
         elapsed = time.time() - t0
         print(
             f"Epoch {epoch}: train_loss={train_loss:.4f} | "
             f"val_mIoU={val_metrics['mIoU']:.4f} "
             f"(free={val_metrics['IoU_free']:.4f}, occ={val_metrics['IoU_occupied']:.4f}) | "
-            f"time={elapsed:.1f}s"
+            f"lr={optim.param_groups[0]['lr']:.2e} | time={elapsed:.1f}s"
         )
         if val_metrics["mIoU"] > best_miou:
             best_miou = val_metrics["mIoU"]
@@ -124,6 +128,10 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=TRAIN_CONFIG["log_every"])
     p.add_argument("--amp", action="store_true", default=TRAIN_CONFIG["amp"])
     p.add_argument("--no_amp", dest="amp", action="store_false")
+    p.add_argument("--hflip_prob", type=float, default=0.5,
+                   help="probability of horizontal flip augmentation (train split only)")
+    p.add_argument("--pos_weight", type=float, default=1.5,
+                   help="BCE pos_weight on the occupied class (1.0 = balanced)")
     return p.parse_args()
 
 

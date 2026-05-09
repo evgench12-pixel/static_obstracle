@@ -5,15 +5,18 @@ import torch.nn.functional as F
 from src.config import IGNORE_INDEX
 
 
-def masked_bce_with_logits(logits, target, ignore_index=IGNORE_INDEX):
+def masked_bce_with_logits(logits, target, ignore_index=IGNORE_INDEX, pos_weight=None):
     """BCE-with-logits where target == ignore_index gets zero weight.
 
     logits: (B, 1, H, W) float
     target: (B, 1, H, W) long with values {0, 1, ignore_index}
+    pos_weight: scalar weight on the occupied (positive) class — >1 pushes
+        recall on obstacles, useful since the metric averages free + occupied IoU.
     """
     mask = (target != ignore_index).float()
     target_f = target.float() * mask  # set 255→0 for safe BCE input
-    loss = F.binary_cross_entropy_with_logits(logits, target_f, reduction="none")
+    pw = None if pos_weight is None else torch.tensor([pos_weight], device=logits.device, dtype=logits.dtype)
+    loss = F.binary_cross_entropy_with_logits(logits, target_f, reduction="none", pos_weight=pw)
     loss = (loss * mask).sum() / mask.sum().clamp_min(1.0)
     return loss
 
