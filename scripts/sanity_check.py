@@ -1,20 +1,29 @@
 """Smoke test: load one batch, run model, compute loss + metric, validate shapes.
 
-Run from the project root: python -m scripts.sanity_check
+Run from the project root:
+    python -m scripts.sanity_check                # default (multicam_cnn)
+    python -m scripts.sanity_check --model lss    # LSS
+
+Or from a notebook:
+    from scripts.sanity_check import main
+    main(model_name="lss")
 """
+import argparse
+
 import torch
 from torch.utils.data import DataLoader
 
 from src.config import OUT_SIZE
 from src.dataset import StaticBEVDataset
+from src.factory import build_model
 from src.losses import masked_bce_with_logits
 from src.metrics import MeanIoU
-from src.model import MultiCamCNN
 
 
-def main():
+def main(model_name: str = "multicam_cnn"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Model: {model_name}")
 
     ds = StaticBEVDataset(split="val")
     print(f"Val samples: {len(ds)}")
@@ -25,13 +34,15 @@ def main():
     for k, v in batch.items():
         print(f"  {k}: {tuple(v.shape) if hasattr(v, 'shape') else v}")
 
-    model = MultiCamCNN().to(device)
+    model = build_model(model_name).to(device)
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
     images = batch["images"].to(device)
+    intrinsics = batch["intrinsics"].to(device)
+    car2cams = batch["car2cams"].to(device)
     gt = batch["gt"].to(device)
 
-    logits = model(images)
+    logits = model(images, intrinsics, car2cams)
     print(f"Logits shape: {tuple(logits.shape)}, expected (B, 1, {OUT_SIZE[0]}, {OUT_SIZE[1]})")
     assert logits.shape[1:] == (1, OUT_SIZE[0], OUT_SIZE[1]), "output shape mismatch"
 
@@ -47,4 +58,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", type=str, default="multicam_cnn", choices=["multicam_cnn", "lss"])
+    args = p.parse_args()
+    main(args.model)

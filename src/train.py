@@ -11,9 +11,9 @@ from tqdm.auto import tqdm
 
 from src.config import CKPT_DIR, DATA_ROOT, TRAIN_CONFIG
 from src.dataset import StaticBEVDataset
+from src.factory import build_model
 from src.losses import masked_bce_with_logits
 from src.metrics import MeanIoU
-from src.model import MultiCamCNN
 
 
 def train_one_epoch(model, loader, optim, scaler, device, log_every=50):
@@ -22,11 +22,13 @@ def train_one_epoch(model, loader, optim, scaler, device, log_every=50):
     pbar = tqdm(loader, desc="train")
     for i, batch in enumerate(pbar):
         images = batch["images"].to(device, non_blocking=True)
+        intrinsics = batch["intrinsics"].to(device, non_blocking=True)
+        car2cams = batch["car2cams"].to(device, non_blocking=True)
         gt = batch["gt"].to(device, non_blocking=True)
 
         optim.zero_grad(set_to_none=True)
         with autocast(enabled=scaler is not None):
-            logits = model(images)
+            logits = model(images, intrinsics, car2cams)
             loss = masked_bce_with_logits(logits, gt)
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -48,8 +50,10 @@ def evaluate(model, loader, device):
     metric = MeanIoU()
     for batch in tqdm(loader, desc="eval"):
         images = batch["images"].to(device, non_blocking=True)
+        intrinsics = batch["intrinsics"].to(device, non_blocking=True)
+        car2cams = batch["car2cams"].to(device, non_blocking=True)
         gt = batch["gt"].to(device, non_blocking=True)
-        logits = model(images)
+        logits = model(images, intrinsics, car2cams)
         preds = (torch.sigmoid(logits) > 0.5).long()
         metric.update(preds, gt)
     return metric.compute()
@@ -73,7 +77,8 @@ def main(args):
     )
     print(f"train: {len(train_ds)} samples, val: {len(val_ds)} samples")
 
-    model = MultiCamCNN().to(device)
+    model = build_model(cfg["model"]).to(device)
+    print(f"Model: {cfg['model']} ({sum(p.numel() for p in model.parameters()):,} params)")
     optim = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     scaler = GradScaler() if (cfg["amp"] and device.type == "cuda") else None
 
@@ -96,16 +101,19 @@ def main(args):
         )
         if val_metrics["mIoU"] > best_miou:
             best_miou = val_metrics["mIoU"]
+            ckpt_path = ckpt_dir / f"best_{cfg['model']}.pt"
             torch.save({
                 "model": model.state_dict(),
+                "model_name": cfg["model"],
                 "epoch": epoch,
                 "val_metrics": val_metrics,
-            }, ckpt_dir / "best.pt")
-            print(f"  saved best (mIoU={best_miou:.4f})")
+            }, ckpt_path)
+            print(f"  saved best (mIoU={best_miou:.4f}) → {ckpt_path}")
 
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--model", type=str, default="multicam_cnn", choices=["multicam_cnn", "lss"])
     p.add_argument("--data_root", type=str, default=str(DATA_ROOT))
     p.add_argument("--ckpt_dir", type=str, default=str(CKPT_DIR))
     p.add_argument("--epochs", type=int, default=TRAIN_CONFIG["epochs"])

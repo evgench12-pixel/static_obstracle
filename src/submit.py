@@ -20,7 +20,7 @@ from src.config import (
     TRAIN_CONFIG,
 )
 from src.dataset import StaticBEVDataset
-from src.model import MultiCamCNN
+from src.factory import build_model
 
 
 @torch.no_grad()
@@ -37,8 +37,10 @@ def predict_test(model, data_root, batch_size, num_workers, device):
     written = 0
     for batch in tqdm(loader, desc="test inference"):
         images = batch["images"].to(device, non_blocking=True)
+        intrinsics = batch["intrinsics"].to(device, non_blocking=True)
+        car2cams = batch["car2cams"].to(device, non_blocking=True)
         idxs = batch["index"].tolist()
-        logits = model(images)
+        logits = model(images, intrinsics, car2cams)
         preds = (torch.sigmoid(logits) > 0.5).cpu().numpy().astype(np.int32)  # (B, 1, 188, 126)
         for i, idx in enumerate(idxs):
             rel = info.iloc[idx]["predicted_occupancy_grid"]
@@ -63,12 +65,13 @@ def build_zip(test_dir, out_path):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultiCamCNN().to(device)
 
     ckpt = torch.load(args.ckpt, map_location=device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    model_name = args.model or (ckpt.get("model_name") if isinstance(ckpt, dict) else None) or "multicam_cnn"
+    model = build_model(model_name).to(device)
     model.load_state_dict(state)
-    print(f"Loaded checkpoint from {args.ckpt}")
+    print(f"Loaded {model_name} checkpoint from {args.ckpt}")
 
     test_dir = predict_test(model, args.data_root, args.batch_size, args.num_workers, device)
     build_zip(test_dir, Path(args.out))
@@ -76,7 +79,9 @@ def main(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", type=str, default=str(Path(CKPT_DIR) / "best.pt"))
+    p.add_argument("--ckpt", type=str, required=True)
+    p.add_argument("--model", type=str, default=None,
+                   help="multicam_cnn or lss; if omitted, read from checkpoint metadata")
     p.add_argument("--data_root", type=str, default=str(DATA_ROOT))
     p.add_argument("--out", type=str, default=str(SUBMISSION_DIR / "submission.zip"))
     p.add_argument("--batch_size", type=int, default=TRAIN_CONFIG["batch_size"])

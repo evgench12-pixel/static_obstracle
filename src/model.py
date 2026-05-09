@@ -44,8 +44,12 @@ class MultiCamCNN(nn.Module):
             nn.Conv2d(32, 1, 1),
         )
 
-    def forward(self, images):
-        """images: (B, num_cams, 3, H, W) → logits (B, 1, 188, 126)."""
+    def forward(self, images, intrinsics=None, car2cams=None):
+        """images: (B, num_cams, 3, H, W) → logits (B, 1, 188, 126).
+
+        intrinsics/car2cams accepted to share signature with geometric models
+        but unused here — this baseline ignores camera calibration.
+        """
         B, N, C, H, W = images.shape
         x = images.view(B * N, C, H, W)
         feats = self.encoder(x)  # (B*N, 512, h, w)
