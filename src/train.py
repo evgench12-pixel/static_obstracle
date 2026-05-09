@@ -13,11 +13,18 @@ from tqdm.auto import tqdm
 from src.config import CKPT_DIR, DATA_ROOT, TRAIN_CONFIG
 from src.dataset import StaticBEVDataset
 from src.factory import build_model
-from src.losses import masked_bce_with_logits
+from src.losses import bce_dice_loss, masked_bce_with_logits
 from src.metrics import MeanIoU
 
 
-def train_one_epoch(model, loader, optim, scaler, device, log_every=50, pos_weight=None):
+LOSSES = {
+    "bce": masked_bce_with_logits,
+    "bce_dice": bce_dice_loss,
+}
+
+
+def train_one_epoch(model, loader, optim, scaler, device, log_every=50,
+                    pos_weight=None, loss_fn=masked_bce_with_logits):
     model.train()
     losses = []
     pbar = tqdm(loader, desc="train")
@@ -30,7 +37,7 @@ def train_one_epoch(model, loader, optim, scaler, device, log_every=50, pos_weig
         optim.zero_grad(set_to_none=True)
         with autocast(enabled=scaler is not None):
             logits = model(images, intrinsics, car2cams)
-            loss = masked_bce_with_logits(logits, gt, pos_weight=pos_weight)
+            loss = loss_fn(logits, gt, pos_weight=pos_weight)
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.step(optim)
@@ -88,11 +95,14 @@ def main(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_miou = -1.0
 
+    loss_fn = LOSSES[cfg.get("loss", "bce")]
+    print(f"Loss: {cfg.get('loss', 'bce')}")
+
     for epoch in range(cfg["epochs"]):
         t0 = time.time()
         train_loss = train_one_epoch(
             model, train_loader, optim, scaler, device, cfg["log_every"],
-            pos_weight=cfg["pos_weight"],
+            pos_weight=cfg["pos_weight"], loss_fn=loss_fn,
         )
         val_metrics = evaluate(model, val_loader, device)
         scheduler.step()
@@ -133,6 +143,7 @@ def parse_args():
                    help="probability of horizontal flip augmentation (train split only)")
     p.add_argument("--pos_weight", type=float, default=1.5,
                    help="BCE pos_weight on the occupied class (1.0 = balanced)")
+    p.add_argument("--loss", type=str, default="bce", choices=list(LOSSES))
     return p.parse_args()
 
 

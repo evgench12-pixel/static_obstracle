@@ -23,13 +23,18 @@ from src.config import (
 )
 
 
-def build_image_transform(image_size=IMAGE_SIZE):
-    return v2.Compose([
-        v2.PILToTensor(),
+def build_image_transform(image_size=IMAGE_SIZE, training=False):
+    transforms = [v2.PILToTensor()]
+    if training:
+        transforms.append(
+            v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.03)
+        )
+    transforms += [
         v2.Resize(image_size, antialias=True),
         v2.ConvertImageDtype(torch.float32),
         v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ])
+    ]
+    return v2.Compose(transforms)
 
 
 class StaticBEVDataset(Dataset):
@@ -47,7 +52,9 @@ class StaticBEVDataset(Dataset):
         self.split = split
         self.split_dir = self.data_root / SPLIT_DIRS[split]
         self.info = pd.read_csv(self.split_dir / "info.csv", index_col=0)
-        self.transform = transform or build_image_transform(target_size)
+        self.transform = transform or build_image_transform(
+            target_size, training=(split == "train")
+        )
         self.target_h, self.target_w = target_size
         self.hflip_prob = hflip_prob if split == "train" else 0.0
 
