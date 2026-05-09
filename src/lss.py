@@ -31,11 +31,16 @@ BEV_RES = 0.8
 # Depth-bin range for the lift step
 DEPTH_RANGE = (2.0, 80.0)
 DEPTH_BINS = 39   # 2.0 step
-DOWNSAMPLE = 32   # ResNet18 final stride
+DOWNSAMPLE = 16   # ResNet18 layer3 stride; /16 gives 4x more frustum points than /32
 
 
 def make_frustum(image_size, downsample, depth_range, depth_bins):
-    """Per-camera frustum points (D, H', W', 3) in image+depth coords (u*d, v*d, d)."""
+    """Per-camera frustum points (D, H', W', 3) in image+depth coords (u*d, v*d, d).
+
+    Uses receptive-field-center pixel coordinates: feature pixel (i, j) at stride s
+    corresponds to image pixel (s*j + s/2, s*i + s/2). This matches CNNs better
+    than torch.linspace(0, W-1, W//s) which off-by-half a stride.
+    """
     H, W = image_size
     Hf, Wf = H // downsample, W // downsample
 
@@ -43,8 +48,8 @@ def make_frustum(image_size, downsample, depth_range, depth_bins):
     d_step = (d_max - d_min) / depth_bins
     depths = torch.linspace(d_min + d_step / 2, d_max - d_step / 2, depth_bins)
 
-    u = torch.linspace(0, W - 1, Wf)
-    v = torch.linspace(0, H - 1, Hf)
+    u = torch.arange(Wf).float() * downsample + downsample / 2
+    v = torch.arange(Hf).float() * downsample + downsample / 2
 
     d_grid = depths[:, None, None].expand(-1, Hf, Wf)
     u_grid = u[None, None, :].expand(depth_bins, Hf, -1)
@@ -115,25 +120,29 @@ def voxel_pool(features, geom, bev_x_range, bev_y_range, bev_res, bev_shape):
     bev_idx = (bx * W_bev + by).reshape(B, -1)
     mask_flat = in_grid.reshape(B, -1)
 
-    feat_flat = feat_flat * mask_flat.unsqueeze(-1).to(feat_flat.dtype)
+    # Accumulate in fp32 for numerical stability (many points splat into same cell;
+    # fp16 scatter_add loses precision with hot cells).
+    feat_flat = feat_flat.float() * mask_flat.unsqueeze(-1).float()
     bev_idx = torch.where(mask_flat, bev_idx, torch.zeros_like(bev_idx))
 
-    bev = torch.zeros(B, H_bev * W_bev, C, device=features.device, dtype=features.dtype)
+    bev = torch.zeros(B, H_bev * W_bev, C, device=features.device, dtype=torch.float32)
     bev.scatter_add_(1, bev_idx.unsqueeze(-1).expand(-1, -1, C), feat_flat)
-    return bev.view(B, H_bev, W_bev, C).permute(0, 3, 1, 2).contiguous()
+    bev = bev.view(B, H_bev, W_bev, C).permute(0, 3, 1, 2).contiguous()
+    return bev.to(features.dtype)
 
 
 class CamEncoder(nn.Module):
-    """ResNet18 → 1x1 head producing (D depth weights, C features) per pixel."""
+    """ResNet18 truncated at layer3 (/16, 256 ch) → 1x1 head producing (D, C)."""
 
     def __init__(self, depth_bins=DEPTH_BINS, feat_dim=64, pretrained=True):
         super().__init__()
         weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = torchvision.models.resnet18(weights=weights)
-        self.backbone = nn.Sequential(*list(backbone.children())[:-2])  # to layer4: /32, 512 ch
+        # Truncate at layer3 for /16 features (denser splat than /32 from layer4)
+        self.backbone = nn.Sequential(*list(backbone.children())[:-3])
         self.depth_bins = depth_bins
         self.feat_dim = feat_dim
-        self.head = nn.Conv2d(512, depth_bins + feat_dim, 1)
+        self.head = nn.Conv2d(256, depth_bins + feat_dim, 1)
 
     def forward(self, x):
         # x: (B*N, 3, H, W) → volume (B*N, D, C, H', W')
