@@ -132,21 +132,33 @@ def voxel_pool(features, geom, bev_x_range, bev_y_range, bev_res, bev_shape):
 
 
 class CamEncoder(nn.Module):
-    """ResNet18 truncated at layer3 (/16, 256 ch) → 1x1 head producing (D, C)."""
+    """ResNet18 with a tiny FPN-like merge of layer3 (/16) and upsampled layer4 (/32→/16).
+
+    Combining both keeps the full ResNet18 capacity (~11M params) AND yields
+    dense /16 features for the splat step.
+    """
 
     def __init__(self, depth_bins=DEPTH_BINS, feat_dim=64, pretrained=True):
         super().__init__()
         weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-        backbone = torchvision.models.resnet18(weights=weights)
-        # Truncate at layer3 for /16 features (denser splat than /32 from layer4)
-        self.backbone = nn.Sequential(*list(backbone.children())[:-3])
+        rn = torchvision.models.resnet18(weights=weights)
+        self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
+        self.layer1 = rn.layer1
+        self.layer2 = rn.layer2
+        self.layer3 = rn.layer3
+        self.layer4 = rn.layer4
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.depth_bins = depth_bins
         self.feat_dim = feat_dim
-        self.head = nn.Conv2d(256, depth_bins + feat_dim, 1)
+        self.head = nn.Conv2d(256 + 512, depth_bins + feat_dim, 1)
 
     def forward(self, x):
-        # x: (B*N, 3, H, W) → volume (B*N, D, C, H', W')
-        feat = self.backbone(x)
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        f3 = self.layer3(x)              # (B*N, 256, H/16, W/16)
+        f4 = self.up(self.layer4(f3))    # (B*N, 512, H/16, W/16)
+        feat = torch.cat([f3, f4], dim=1)
         head = self.head(feat)
         depth = head[:, : self.depth_bins].softmax(dim=1)
         feat_out = head[:, self.depth_bins:]
