@@ -18,6 +18,7 @@ Car frame convention used here: X=forward, Y=right, Z=up (per contest spec).
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 
 from src.config import IMAGE_SIZE, OUT_SIZE
@@ -165,24 +166,49 @@ class CamEncoder(nn.Module):
         return depth.unsqueeze(2) * feat_out.unsqueeze(1)
 
 
+def _conv_block(in_ch, out_ch):
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, 3, padding=1),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_ch, out_ch, 3, padding=1),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+    )
+
+
 class BEVDecoder(nn.Module):
+    """U-Net-style decoder on the BEV grid for global receptive field.
+
+    Three encoder levels (188→94→47→24 px) + three decoder levels with skip
+    connections. A long static obstacle that spans tens of meters can only
+    be reasoned about with a global view — a stack of 3x3 convs is not enough.
+    """
+
     def __init__(self, in_ch=64, out_ch=1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, out_ch, 1),
-        )
+        self.enc1 = _conv_block(in_ch, 64)
+        self.enc2 = _conv_block(64, 128)
+        self.enc3 = _conv_block(128, 256)
+        self.bottleneck = _conv_block(256, 256)
+        self.dec3 = _conv_block(256 + 256, 128)
+        self.dec2 = _conv_block(128 + 128, 64)
+        self.dec1 = _conv_block(64 + 64, 32)
+        self.out = nn.Conv2d(32, out_ch, 1)
 
     def forward(self, x):
-        return self.net(x)
+        e1 = self.enc1(x)
+        e2 = self.enc2(F.max_pool2d(e1, 2))
+        e3 = self.enc3(F.max_pool2d(e2, 2))
+        b = self.bottleneck(F.max_pool2d(e3, 2))
+
+        u3 = F.interpolate(b, size=e3.shape[2:], mode="bilinear", align_corners=False)
+        u3 = self.dec3(torch.cat([u3, e3], dim=1))
+        u2 = F.interpolate(u3, size=e2.shape[2:], mode="bilinear", align_corners=False)
+        u2 = self.dec2(torch.cat([u2, e2], dim=1))
+        u1 = F.interpolate(u2, size=e1.shape[2:], mode="bilinear", align_corners=False)
+        u1 = self.dec1(torch.cat([u1, e1], dim=1))
+        return self.out(u1)
 
 
 class LiftSplatShoot(nn.Module):
