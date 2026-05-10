@@ -134,6 +134,7 @@ def main(args):
             torch.save({
                 "model": model.state_dict(),
                 "model_name": cfg["model"],
+                "image_size": list(image_size),
                 "epoch": epoch,
                 "val_metrics": val_metrics,
             }, ckpt_path)

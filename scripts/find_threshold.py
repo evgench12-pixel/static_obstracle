@@ -20,7 +20,9 @@ from src.submit import _hflip_inputs
 
 @torch.no_grad()
 def collect_probs(model, loader, device, tta=False, target_w=IMAGE_SIZE[1]):
-    """Returns flat tensors of probs (N,) and gt (N,) over all val pixels (255-masked)."""
+    """Returns flat tensors of probs (N,) and gt (N,) over all val pixels (255-masked).
+
+    target_w is the (resized) image width; passed to the hflip helper for cx mirroring."""
     model.eval()
     all_probs, all_gt = [], []
     for batch in tqdm(loader, desc="collect val probs"):
@@ -65,20 +67,29 @@ def sweep_thresholds(probs, gt, thresholds=None):
 
 
 def main(ckpt: str, model_name: str = None, tta: bool = True,
-         data_root: str = str(DATA_ROOT), batch_size: int = 8, num_workers: int = 4):
+         data_root: str = str(DATA_ROOT), batch_size: int = 8, num_workers: int = 4,
+         image_size=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     state = torch.load(ckpt, map_location=device)
     sd = state["model"] if isinstance(state, dict) and "model" in state else state
     name = model_name or (state.get("model_name") if isinstance(state, dict) else None) or "lss"
-    model = build_model(name).to(device)
-    model.load_state_dict(sd)
-    print(f"Loaded {name} from {ckpt}")
 
-    val_ds = StaticBEVDataset(data_root, split="val")
+    if image_size is None and isinstance(state, dict) and state.get("image_size") is not None:
+        image_size = tuple(state["image_size"])
+    if image_size is None:
+        image_size = IMAGE_SIZE
+    image_size = tuple(image_size)
+
+    model_kwargs = {"image_size": image_size} if name.startswith("lss") else {}
+    model = build_model(name, **model_kwargs).to(device)
+    model.load_state_dict(sd)
+    print(f"Loaded {name} (image_size={image_size}) from {ckpt}")
+
+    val_ds = StaticBEVDataset(data_root, split="val", target_size=image_size)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=True)
 
-    probs, gt = collect_probs(model, val_loader, device, tta=tta)
+    probs, gt = collect_probs(model, val_loader, device, tta=tta, target_w=image_size[1])
     rows = sweep_thresholds(probs, gt)
     print(f"\n{'thr':>6} {'mIoU':>8} {'free':>8} {'occ':>8}")
     best = max(rows, key=lambda r: r[1])

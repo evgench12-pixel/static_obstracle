@@ -40,15 +40,15 @@ def _hflip_inputs(images, intrinsics, car2cams, target_w):
 
 @torch.no_grad()
 def predict_test(model, data_root, batch_size, num_workers, device,
-                 tta=False, threshold=0.5):
+                 tta=False, threshold=0.5, image_size=IMAGE_SIZE):
     test_dir = Path(data_root) / SPLIT_DIRS["test"]
     info = pd.read_csv(test_dir / "info.csv", index_col=0)
-    ds = StaticBEVDataset(data_root, split="test")
+    ds = StaticBEVDataset(data_root, split="test", target_size=image_size)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     pred_dir = test_dir / "predicted_static_grids"
     pred_dir.mkdir(exist_ok=True)
-    target_w = IMAGE_SIZE[1]
+    target_w = image_size[1]
 
     model.eval()
     written = 0
@@ -95,13 +95,24 @@ def main(args):
     ckpt = torch.load(args.ckpt, map_location=device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model_name = args.model or (ckpt.get("model_name") if isinstance(ckpt, dict) else None) or "multicam_cnn"
-    model = build_model(model_name).to(device)
+
+    # Resolve image_size: explicit arg > checkpoint metadata > default
+    image_size = tuple(args.image_size) if args.image_size else None
+    if image_size is None and isinstance(ckpt, dict) and ckpt.get("image_size") is not None:
+        image_size = tuple(ckpt["image_size"])
+    if image_size is None:
+        image_size = IMAGE_SIZE
+
+    model_kwargs = {}
+    if model_name.startswith("lss"):
+        model_kwargs["image_size"] = image_size
+    model = build_model(model_name, **model_kwargs).to(device)
     model.load_state_dict(state)
-    print(f"Loaded {model_name} checkpoint from {args.ckpt}")
+    print(f"Loaded {model_name} (image_size={image_size}) from {args.ckpt}")
 
     test_dir = predict_test(
         model, args.data_root, args.batch_size, args.num_workers, device,
-        tta=args.tta, threshold=args.threshold,
+        tta=args.tta, threshold=args.threshold, image_size=image_size,
     )
     build_zip(test_dir, Path(args.out))
 
@@ -117,6 +128,8 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=TRAIN_CONFIG["num_workers"])
     p.add_argument("--tta", action="store_true", help="Average predictions of normal + hflipped input")
     p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--image_size", type=int, nargs=2, default=None,
+                   help="(H, W); if omitted, read from checkpoint or fall back to default")
     return p.parse_args()
 
 
