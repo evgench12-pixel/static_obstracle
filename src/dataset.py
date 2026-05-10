@@ -46,17 +46,21 @@ class StaticBEVDataset(Dataset):
     """
 
     def __init__(self, data_root=DATA_ROOT, split="train", transform=None,
-                 target_size=IMAGE_SIZE, hflip_prob=0.0):
+                 target_size=IMAGE_SIZE, hflip_prob=0.0, pseudo_dir=None):
         assert split in SPLIT_DIRS, f"unknown split: {split}"
         self.data_root = Path(data_root)
         self.split = split
         self.split_dir = self.data_root / SPLIT_DIRS[split]
         self.info = pd.read_csv(self.split_dir / "info.csv", index_col=0)
         self.transform = transform or build_image_transform(
-            target_size, training=(split == "train")
+            target_size, training=(split == "train" or pseudo_dir is not None)
         )
         self.target_h, self.target_w = target_size
-        self.hflip_prob = hflip_prob if split == "train" else 0.0
+        self.hflip_prob = hflip_prob if (split == "train" or pseudo_dir is not None) else 0.0
+        # If pseudo_dir is set, treat samples like train: emit GT loaded from
+        # pseudo_dir instead of from gt_occupancy_grid (intended for the test
+        # split during pseudo-label training).
+        self.pseudo_dir = Path(pseudo_dir) if pseudo_dir is not None else None
 
     def __len__(self):
         return len(self.info)
@@ -91,7 +95,12 @@ class StaticBEVDataset(Dataset):
             "car2cams": torch.from_numpy(car2cams).float(),
             "index": idx,
         }
-        if self.split != "test":
+        if self.pseudo_dir is not None:
+            # test sample with pseudo-label as GT
+            fname = Path(row["predicted_occupancy_grid"]).name
+            gt = np.load(self.pseudo_dir / fname)
+            sample["gt"] = torch.from_numpy(gt).long()
+        elif self.split != "test":
             gt = np.load(self._resolve(row["gt_occupancy_grid"]))  # (1, 188, 126), int32
             sample["gt"] = torch.from_numpy(gt).long()
 

@@ -7,10 +7,10 @@ import torch
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from tqdm.auto import tqdm
 
-from src.config import CKPT_DIR, DATA_ROOT, TRAIN_CONFIG
+from src.config import CKPT_DIR, DATA_ROOT, IMAGE_SIZE, TRAIN_CONFIG
 from src.dataset import StaticBEVDataset
 from src.factory import build_model
 from src.losses import bce_dice_loss, masked_bce_with_logits
@@ -73,8 +73,20 @@ def main(args):
     print(f"Device: {device}")
     print(f"Config: {cfg}")
 
-    train_ds = StaticBEVDataset(cfg["data_root"], split="train", hflip_prob=cfg["hflip_prob"])
-    val_ds = StaticBEVDataset(cfg["data_root"], split="val")
+    image_size = tuple(cfg.get("image_size", IMAGE_SIZE))
+    print(f"Image size: {image_size}")
+
+    train_ds = StaticBEVDataset(cfg["data_root"], split="train",
+                                target_size=image_size, hflip_prob=cfg["hflip_prob"])
+    if cfg.get("pseudo_dir"):
+        pseudo_ds = StaticBEVDataset(
+            cfg["data_root"], split="test",
+            target_size=image_size, hflip_prob=cfg["hflip_prob"],
+            pseudo_dir=cfg["pseudo_dir"],
+        )
+        print(f"Pseudo-label dataset: {len(pseudo_ds)} samples (from {cfg['pseudo_dir']})")
+        train_ds = ConcatDataset([train_ds, pseudo_ds])
+    val_ds = StaticBEVDataset(cfg["data_root"], split="val", target_size=image_size)
     train_loader = DataLoader(
         train_ds, batch_size=cfg["batch_size"], shuffle=True,
         num_workers=cfg["num_workers"], pin_memory=True, drop_last=True,
@@ -85,7 +97,10 @@ def main(args):
     )
     print(f"train: {len(train_ds)} samples, val: {len(val_ds)} samples")
 
-    model = build_model(cfg["model"]).to(device)
+    model_kwargs = {}
+    if cfg["model"].startswith("lss"):
+        model_kwargs["image_size"] = image_size
+    model = build_model(cfg["model"], **model_kwargs).to(device)
     print(f"Model: {cfg['model']} ({sum(p.numel() for p in model.parameters()):,} params)")
     optim = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     scheduler = CosineAnnealingLR(optim, T_max=cfg["epochs"], eta_min=cfg["lr"] * 0.01)
@@ -144,7 +159,14 @@ def parse_args():
     p.add_argument("--pos_weight", type=float, default=1.5,
                    help="BCE pos_weight on the occupied class (1.0 = balanced)")
     p.add_argument("--loss", type=str, default="bce", choices=list(LOSSES))
-    return p.parse_args()
+    p.add_argument("--pseudo_dir", type=str, default=None,
+                   help="path to pseudo-label dir (e.g. ~/.../test/pseudo_labels);"
+                        " if set, test split with these labels is concatenated to train")
+    p.add_argument("--image_height", type=int, default=IMAGE_SIZE[0])
+    p.add_argument("--image_width", type=int, default=IMAGE_SIZE[1])
+    args = p.parse_args()
+    args.image_size = (args.image_height, args.image_width)
+    return args
 
 
 if __name__ == "__main__":
