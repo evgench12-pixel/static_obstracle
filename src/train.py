@@ -144,7 +144,8 @@ def main(args):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", type=str, default="multicam_cnn",
-                   choices=["multicam_cnn", "lss", "lss_r50"])
+                   choices=["multicam_cnn", "lss", "lss_r50",
+                            "lss_convnext_tiny", "lss_convnext_small"])
     p.add_argument("--data_root", type=str, default=str(DATA_ROOT))
     p.add_argument("--ckpt_dir", type=str, default=str(CKPT_DIR))
     p.add_argument("--epochs", type=int, default=TRAIN_CONFIG["epochs"])

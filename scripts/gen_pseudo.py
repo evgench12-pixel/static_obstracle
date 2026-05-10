@@ -23,8 +23,8 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from scripts.ensemble import _ensemble_probs, load_models
-from src.config import DATA_ROOT, IMAGE_SIZE, SPLIT_DIRS
+from scripts.ensemble import _model_probs, load_models
+from src.config import DATA_ROOT, SPLIT_DIRS
 from src.dataset import StaticBEVDataset
 
 
@@ -35,34 +35,41 @@ def main(checkpoints, data_root=str(DATA_ROOT), batch_size=4, num_workers=4,
 
     test_dir = Path(data_root) / SPLIT_DIRS["test"]
     info = pd.read_csv(test_dir / "info.csv", index_col=0)
-    ds = StaticBEVDataset(data_root, split="test")
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=True)
+    n_test = len(info)
+    n_models = len(models)
+    sums = torch.zeros((n_test, 1, 188, 126), dtype=torch.float32)
+    indices = torch.zeros(n_test, dtype=torch.long)
+
+    # Each model predicts on test at its native image_size; average resulting BEV probs
+    for i, entry in enumerate(models):
+        ds = StaticBEVDataset(data_root, split="test", target_size=entry["image_size"])
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+        offset = 0
+        for batch in tqdm(loader, desc=f"pseudo [{i+1}/{n_models}: {entry['name']}]"):
+            with torch.no_grad():
+                probs = _model_probs(entry, batch, device, tta)
+            B = probs.shape[0]
+            sums[offset:offset+B] += probs.cpu().float()
+            if i == 0:
+                indices[offset:offset+B] = batch["index"]
+            offset += B
+    avg = sums / n_models
+
     out_dir = test_dir / "pseudo_labels"
     out_dir.mkdir(exist_ok=True)
-    target_w = IMAGE_SIZE[1]
+    avg_np = avg.numpy()  # (n_test, 1, 188, 126)
+    labels = np.full(avg_np.shape, 255, dtype=np.int32)
+    labels[avg_np > high] = 1
+    labels[avg_np < low] = 0
+    n_zero = int((labels == 0).sum())
+    n_one = int((labels == 1).sum())
+    n_ignore = int((labels == 255).sum())
 
-    n_zero = n_one = n_ignore = 0
-    for batch in tqdm(loader, desc="generating pseudo"):
-        images = batch["images"].to(device, non_blocking=True)
-        intrinsics = batch["intrinsics"].to(device, non_blocking=True)
-        car2cams = batch["car2cams"].to(device, non_blocking=True)
-        idxs = batch["index"].tolist()
-
-        with torch.no_grad():
-            probs = _ensemble_probs(models, images, intrinsics, car2cams, tta, target_w)
-        probs_np = probs.cpu().numpy()  # (B, 1, 188, 126)
-
-        labels = np.full(probs_np.shape, 255, dtype=np.int32)
-        labels[probs_np > high] = 1
-        labels[probs_np < low] = 0
-        n_zero += int((labels == 0).sum())
-        n_one += int((labels == 1).sum())
-        n_ignore += int((labels == 255).sum())
-
-        for i, idx in enumerate(idxs):
-            fname = Path(info.iloc[idx]["predicted_occupancy_grid"]).name
-            np.save(out_dir / fname, labels[i])
+    for k in range(n_test):
+        idx = int(indices[k].item())
+        fname = Path(info.iloc[idx]["predicted_occupancy_grid"]).name
+        np.save(out_dir / fname, labels[k])
 
     total = n_zero + n_one + n_ignore
     print(f"\nDone. Pixel breakdown across {len(info)} samples:")

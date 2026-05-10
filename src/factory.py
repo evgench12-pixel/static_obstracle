@@ -7,6 +7,8 @@ MODELS = {
     "multicam_cnn": MultiCamCNN,
     "lss": LiftSplatShoot,                                       # ResNet18 backbone
     "lss_r50": lambda **kw: LiftSplatShoot(backbone="resnet50", **kw),
+    "lss_convnext_tiny": lambda **kw: LiftSplatShoot(backbone="convnext_tiny", **kw),
+    "lss_convnext_small": lambda **kw: LiftSplatShoot(backbone="convnext_small", **kw),
 }
 
 

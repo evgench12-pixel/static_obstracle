@@ -132,39 +132,69 @@ def voxel_pool(features, geom, bev_x_range, bev_y_range, bev_res, bev_shape):
     return bev.to(features.dtype)
 
 
-_BACKBONES = {
+_RESNET_BACKBONES = {
     "resnet18": (torchvision.models.resnet18,
                  torchvision.models.ResNet18_Weights.IMAGENET1K_V1, 256, 512),
     "resnet50": (torchvision.models.resnet50,
                  torchvision.models.ResNet50_Weights.IMAGENET1K_V2, 1024, 2048),
 }
 
+_CONVNEXT_BACKBONES = {
+    "convnext_tiny": (torchvision.models.convnext_tiny,
+                      torchvision.models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1, 384, 768),
+    "convnext_small": (torchvision.models.convnext_small,
+                       torchvision.models.ConvNeXt_Small_Weights.IMAGENET1K_V1, 384, 768),
+}
+
 
 class CamEncoder(nn.Module):
-    """ResNet backbone with FPN-like merge of layer3 (/16) and upsampled layer4 (/32→/16)."""
+    """Backbone with FPN-like merge of /16 and upsampled /32 features.
+
+    Supports ResNet (resnet18/resnet50) and ConvNeXt (convnext_tiny/convnext_small).
+    """
 
     def __init__(self, backbone="resnet18", depth_bins=DEPTH_BINS, feat_dim=64, pretrained=True):
         super().__init__()
-        if backbone not in _BACKBONES:
-            raise ValueError(f"unknown backbone {backbone!r}; available: {list(_BACKBONES)}")
-        ctor, weights_enum, ch3, ch4 = _BACKBONES[backbone]
-        rn = ctor(weights=weights_enum if pretrained else None)
-        self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
-        self.layer1 = rn.layer1
-        self.layer2 = rn.layer2
-        self.layer3 = rn.layer3
-        self.layer4 = rn.layer4
+        self.backbone_name = backbone
+
+        if backbone in _RESNET_BACKBONES:
+            ctor, weights_enum, ch3, ch4 = _RESNET_BACKBONES[backbone]
+            rn = ctor(weights=weights_enum if pretrained else None)
+            self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
+            self.layer1 = rn.layer1
+            self.layer2 = rn.layer2
+            self.layer3 = rn.layer3
+            self.layer4 = rn.layer4
+            self._kind = "resnet"
+        elif backbone in _CONVNEXT_BACKBONES:
+            ctor, weights_enum, ch3, ch4 = _CONVNEXT_BACKBONES[backbone]
+            cn = ctor(weights=weights_enum if pretrained else None)
+            stages = list(cn.features.children())
+            # ConvNeXt has 8 sub-modules in features: stem + 4 (stage, downsample) pairs.
+            # /16 features come out after stages[5] (stage 3 of 4). /32 after stages[7].
+            self.to_16 = nn.Sequential(*stages[:6])
+            self.to_32 = nn.Sequential(*stages[6:])
+            self._kind = "convnext"
+        else:
+            available = list(_RESNET_BACKBONES) + list(_CONVNEXT_BACKBONES)
+            raise ValueError(f"unknown backbone {backbone!r}; available: {available}")
+
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.depth_bins = depth_bins
         self.feat_dim = feat_dim
         self.head = nn.Conv2d(ch3 + ch4, depth_bins + feat_dim, 1)
 
     def forward(self, x):
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        f3 = self.layer3(x)              # (B*N, 256, H/16, W/16)
-        f4 = self.up(self.layer4(f3))    # (B*N, 512, H/16, W/16)
+        if self._kind == "resnet":
+            x = self.stem(x)
+            x = self.layer1(x)
+            x = self.layer2(x)
+            f3 = self.layer3(x)              # (B*N, ch3, H/16, W/16)
+            f4 = self.layer4(f3)             # (B*N, ch4, H/32, W/32)
+        else:  # convnext
+            f3 = self.to_16(x)
+            f4 = self.to_32(f3)
+        f4 = self.up(f4)                     # → /16
         feat = torch.cat([f3, f4], dim=1)
         head = self.head(feat)
         depth = head[:, : self.depth_bins].softmax(dim=1)
